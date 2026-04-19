@@ -1,0 +1,276 @@
+/*
+ * STM32 Blackpill + AS5600 + Motor Driver (DIR + PWM) + PID
+ *
+ * Assumptions:
+ *  - MCU: STM32 Blackpill (works with F401/F411 style HAL project)
+ *  - AS5600 on I2C1: PB6 = SCL, PB7 = SDA
+ *  - Motor driver:
+ *      DIR  -> GPIO output
+ *      PWM  -> TIM3 CH1 output
+ *      GND  -> common ground
+ *
+ * Notes:
+ *  - This code uses the same AS5600 register read method as your encoder test.
+ *  - CubeMX should generate the peripheral init functions:
+ *      SystemClock_Config()
+ *      MX_GPIO_Init()
+ *      MX_I2C1_Init()
+ *      MX_TIM3_Init()
+ *  - In CubeMX:
+ *      TIM3 CH1 = PWM Generation CH1
+ *      DIR pin = GPIO_Output
+ *      I2C1 = Standard Mode or Fast Mode as needed
+ */
+
+#include "main.h"
+#include <math.h>
+#include <stdbool.h>
+
+/* -------------------- AS5600 -------------------- */
+#define AS5600_ADDR        (0x36 << 1)
+#define AS5600_REG_STATUS  0x0B
+#define AS5600_REG_ANGLE_H 0x0E
+
+/* -------------------- Motor Pins -------------------- */
+#define DIR_GPIO_Port      GPIOB
+#define DIR_Pin            GPIO_PIN_0
+
+/* -------------------- PWM -------------------- */
+extern I2C_HandleTypeDef hi2c1;
+extern TIM_HandleTypeDef htim3;
+
+/* -------------------- Control Parameters -------------------- */
+static float setpoint_deg = 180.0f;   // target angle in degrees
+static float Kp = 3.0f;
+static float Ki = 0.02f;
+static float Kd = 0.20f;
+
+static float integral = 0.0f;
+static float prev_error = 0.0f;
+static uint32_t prev_ms = 0;
+
+/* Optional: limit integral to prevent windup */
+#define INTEGRAL_LIMIT   200.0f
+
+/* PWM limits */
+#define PWM_MAX          999     // for TIM3 period = 999 (1000 counts)
+#define PWM_MIN_MOVE      80     // minimum duty to overcome static friction
+#define DEADBAND_DEG      0.5f   // stop if very close to setpoint
+
+/* -------------------- Prototypes -------------------- */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_TIM3_Init(void);
+static uint16_t AS5600_ReadRawAngle(void);
+static float AS5600_ReadAngleDeg(void);
+static bool AS5600_CheckMagnet(void);
+static float PID_Update(float setpoint, float measured, float dt);
+static void Motor_Apply(float control);
+static float wrap_error_deg(float err);
+
+/* -------------------- Main -------------------- */
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+  MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_TIM3_Init();
+
+  /* Start PWM */
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+
+  /* Safe startup state */
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
+  HAL_GPIO_WritePin(DIR_GPIO_Port, DIR_Pin, GPIO_PIN_RESET);
+  HAL_Delay(200);
+
+  /* Main control loop */
+  prev_ms = HAL_GetTick();
+
+  while (1)
+  {
+    uint32_t now = HAL_GetTick();
+    float dt = (now - prev_ms) / 1000.0f;
+
+    /* Run control at ~100 Hz */
+    if (dt < 0.01f)
+    {
+      continue;
+    }
+    prev_ms = now;
+
+    /* Read encoder */
+    float angle_deg = AS5600_ReadAngleDeg();
+
+    /* Optional sanity check: if magnet missing, stop motor */
+    if (!AS5600_CheckMagnet())
+    {
+      Motor_Apply(0.0f);
+      continue;
+    }
+
+    /* PID control */
+    float control = PID_Update(setpoint_deg, angle_deg, dt);
+
+    /* Apply to motor driver */
+    Motor_Apply(control);
+  }
+}
+
+/* -------------------- AS5600 Read -------------------- */
+static uint16_t AS5600_ReadRawAngle(void)
+{
+  uint8_t buf[2] = {0};
+
+  if (HAL_I2C_Mem_Read(&hi2c1,
+                       AS5600_ADDR,
+                       AS5600_REG_ANGLE_H,
+                       I2C_MEMADD_SIZE_8BIT,
+                       buf,
+                       2,
+                       HAL_MAX_DELAY) != HAL_OK)
+  {
+    return 0;
+  }
+
+  return (uint16_t)(((buf[0] & 0x0F) << 8) | buf[1]);
+}
+
+static float AS5600_ReadAngleDeg(void)
+{
+  uint16_t raw = AS5600_ReadRawAngle();
+  return ((float)raw * 360.0f) / 4096.0f;
+}
+
+static bool AS5600_CheckMagnet(void)
+{
+  uint8_t status = 0;
+  if (HAL_I2C_Mem_Read(&hi2c1,
+                       AS5600_ADDR,
+                       AS5600_REG_STATUS,
+                       I2C_MEMADD_SIZE_8BIT,
+                       &status,
+                       1,
+                       HAL_MAX_DELAY) != HAL_OK)
+  {
+    return false;
+  }
+
+  /* MD bit = bit 5, magnet detected */
+  return ((status >> 5) & 0x01) ? true : false;
+}
+
+/* -------------------- PID -------------------- */
+static float wrap_error_deg(float err)
+{
+  /* Keep error inside [-180, 180] for shortest path */
+  while (err > 180.0f)  err -= 360.0f;
+  while (err < -180.0f) err += 360.0f;
+  return err;
+}
+
+static float PID_Update(float setpoint, float measured, float dt)
+{
+  float error = wrap_error_deg(setpoint - measured);
+
+  /* Deadband: stop motor close to target */
+  if (fabsf(error) <= DEADBAND_DEG)
+  {
+    integral = 0.0f;
+    prev_error = error;
+    return 0.0f;
+  }
+
+  integral += error * dt;
+
+  /* Anti-windup */
+  if (integral > INTEGRAL_LIMIT)  integral = INTEGRAL_LIMIT;
+  if (integral < -INTEGRAL_LIMIT) integral = -INTEGRAL_LIMIT;
+
+  float derivative = (error - prev_error) / dt;
+  prev_error = error;
+
+  float output = (Kp * error) + (Ki * integral) + (Kd * derivative);
+
+  /* Clamp final command to usable range */
+  if (output > PWM_MAX)  output = PWM_MAX;
+  if (output < -PWM_MAX) output = -PWM_MAX;
+
+  return output;
+}
+
+/* -------------------- Motor Driver Control -------------------- */
+static void Motor_Apply(float control)
+{
+  if (control == 0.0f)
+  {
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
+    return;
+  }
+
+  GPIO_PinState dir = (control > 0.0f) ? GPIO_PIN_SET : GPIO_PIN_RESET;
+  HAL_GPIO_WritePin(DIR_GPIO_Port, DIR_Pin, dir);
+
+  float mag = fabsf(control);
+
+  /* Minimum drive to overcome dead-zone / stiction */
+  if (mag > 0.0f && mag < PWM_MIN_MOVE)
+  {
+    mag = PWM_MIN_MOVE;
+  }
+
+  if (mag > PWM_MAX)
+  {
+    mag = PWM_MAX;
+  }
+
+  __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, (uint32_t)mag);
+}
+
+/* -------------------- Peripheral Init Notes -------------------- */
+/*
+ * In CubeMX set TIM3 period so PWM_MAX matches ARR.
+ * Example:
+ *   Prescaler = 83
+ *   Period    = 999
+ * for 1 kHz PWM at 84 MHz timer clock.
+ *
+ * DIR pin should be a push-pull GPIO output.
+ *
+ * I2C1 pins on Blackpill are commonly PB6/PB7.
+ */
+
+/* -------------------- Standard HAL Stubs -------------------- */
+/*
+ * Keep your CubeMX-generated versions of these functions.
+ * They are included here only as declarations so this file is self-contained.
+ */
+void SystemClock_Config(void)
+{
+  /* Use your CubeMX-generated clock config here. */
+}
+
+static void MX_GPIO_Init(void)
+{
+  /* Use your CubeMX-generated GPIO init here. */
+}
+
+static void MX_I2C1_Init(void)
+{
+  /* Use your CubeMX-generated I2C1 init here. */
+}
+
+static void MX_TIM3_Init(void)
+{
+  /* Use your CubeMX-generated TIM3 PWM init here. */
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1)
+  {
+  }
+}
